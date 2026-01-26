@@ -29,12 +29,10 @@ app = FastAPI(title="Quant Suite API", version="1.0")
 # Allow Next.js dev server to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # Next.js dev
-    ],
+    allow_origins=["*"],  # Allow all origins for now
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # CRITICAL: Must allow all methods including OPTIONS
+    allow_headers=["*"],  # CRITICAL: Must allow all headers
 )
 
 # -------------------------
