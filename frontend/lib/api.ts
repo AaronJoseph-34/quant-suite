@@ -1,7 +1,5 @@
 export async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  const API_BASE =
-    process.env.NEXT_PUBLIC_API_URL ??
-    "http://localhost:8000";
+const API_BASE = "https://quant-suite-production.up.railway.app";
   
   // TEMPORARY DEBUG - Remove after fixing
   console.log("Environment variable:", process.env.NEXT_PUBLIC_API_URL);
