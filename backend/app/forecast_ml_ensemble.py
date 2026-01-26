@@ -5,8 +5,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_squared_error
 
-import xgboost as xgb
-import lightgbm as lgb
+
 
 
 # ---------------------------
@@ -52,24 +51,7 @@ def build_models():
             random_state=42,
         ),
 
-        "xgb": xgb.XGBRegressor(
-            n_estimators=400,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            objective="reg:squarederror",
-            random_state=42,
-        ),
-
-        "lgbm": lgb.LGBMRegressor(
-            n_estimators=400,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            random_state=42,
-        ),
+        
     }
 
 
