@@ -1,6 +1,6 @@
 export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   const base =
-    process.env.NEXT_PUBLIC_API_BASE?.trim() || "http://localhost:8000";
+    process.env.NEXT_PUBLIC_API_BASE?.trim() || "quant-suite-production.up.railway.app";
 
   const res = await fetch(`${base}${path}`, {
     method: "POST",

@@ -81,7 +81,8 @@ export default function PriceChart({ data }: { data: ChartRow[] }) {
             color: "#E5E7EB",
             fontSize: 12,
           }}
-          formatter={(value: any, name: string) => [value, name]}
+          formatter={(value: any, name: any) => [value, String(name ?? "")]}
+
           labelFormatter={(label: any) => {
             const row = enriched.find((x) => x.t === label);
             return row?.date
