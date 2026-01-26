@@ -1,6 +1,4 @@
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE ??
-  "http://localhost:8000";
+const API_BASE = "https://quant-suite-production.up.railway.app";
 
 export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   console.log("API_BASE:", API_BASE);
