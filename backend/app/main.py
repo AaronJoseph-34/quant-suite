@@ -1,55 +1,86 @@
 from __future__ import annotations
-from app.data_provider import fetch_market_data
-from dotenv import load_dotenv
-load_dotenv(".env")
-from app.portfolio_risk import compute_portfolio_risk
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from typing import List, Literal, Optional, Dict, Any
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import yfinance as yf
-from app.forecast_ml_ensemble import ml_forecast
-from typing import List, Optional
-from pydantic import BaseModel
+
+import os
+from typing import Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 from scipy.optimize import brentq
+from scipy.stats import norm
 from statsmodels.tsa.arima.model import ARIMA
-from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
 
+load_dotenv()
+from app.data_provider import fetch_market_data
+from app.forecast_metrics import backtest_metrics, confidence_band
+from app.forecast_ml_ensemble import ml_forecast
+from app.portfolio_risk import compute_portfolio_risk, prices_to_returns
+from app.risk import single_asset_risk, monte_carlo
 
 app = FastAPI(title="Quant Suite API", version="1.0")
 
-# Allow Next.js dev server to call this API
+origins = [origin.strip().rstrip("/") for origin in
+           os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
+if not origins or "*" in origins:
+    raise RuntimeError("CORS_ORIGINS must list explicit frontend origins")
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for now
-    allow_credentials=True,
-    allow_methods=["*"],  # CRITICAL: Must allow all methods including OPTIONS
-    allow_headers=["*"],  # CRITICAL: Must allow all headers
+    CORSMiddleware, allow_origins=origins, allow_credentials=False,
+    allow_methods=["GET", "POST"], allow_headers=["Content-Type"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc: RequestValidationError):
+    # Exclude input/context, which can themselves contain non-JSON NaN values.
+    errors = [{"loc": list(e["loc"]), "msg": e["msg"]} for e in exc.errors()]
+    return JSONResponse(status_code=400, content={"detail": errors})
+
+
+@app.exception_handler(ValueError)
+async def invalid_value(request: Request, exc: ValueError):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+def finite_result(value):
+    if isinstance(value, dict):
+        for child in value.values():
+            finite_result(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            finite_result(child)
+    elif isinstance(value, (float, np.floating)) and not np.isfinite(value):
+        raise ValueError("Inputs produced a non-finite result; reduce their magnitude")
+    return value
+
+
+def validate_option(S, K, T, r, sigma, opt_type):
+    if not all(np.isfinite(v) for v in (S, K, T, r, sigma)):
+        raise ValueError("Option inputs must be finite")
+    if min(S, K, T, sigma) <= 0:
+        raise ValueError("S, K, T and sigma must be greater than zero")
+    if opt_type not in ("call", "put"):
+        raise ValueError("Option type must be call or put")
 
 # -------------------------
 # Helpers: core quant math
 # -------------------------
 
 def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, opt_type: str) -> float:
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return float("nan")
+    validate_option(S, K, T, r, sigma, opt_type)
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
     if opt_type == "call":
-        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        return finite_result(float(S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)))
     else:
-        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        return finite_result(float(K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)))
 
 def black_scholes_greeks(S: float, K: float, T: float, r: float, sigma: float, opt_type: str) -> Dict[str, float]:
+    validate_option(S, K, T, r, sigma, opt_type)
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
 
@@ -75,14 +106,20 @@ def black_scholes_greeks(S: float, K: float, T: float, r: float, sigma: float, o
     }
 
 def implied_volatility(target_price: float, S: float, K: float, T: float, r: float, opt_type: str) -> float:
-    # Solve for sigma in [1e-6, 5.0]
-    def f(sig: float) -> float:
+    validate_option(S, K, T, r, 1.0, opt_type)
+    discounted_strike = finite_result(float(K * np.exp(-r * T)))
+    lower = max(0.0, S - discounted_strike) if opt_type == "call" else max(0.0, discounted_strike - S)
+    upper = S if opt_type == "call" else discounted_strike
+    if not np.isfinite(target_price) or not lower < target_price < upper:
+        raise ValueError(f"Option price must be strictly between {lower:g} and {upper:g}")
+
+    def f(sig):
         return black_scholes_price(S, K, T, r, sig, opt_type) - target_price
 
     try:
         return float(brentq(f, 1e-6, 5.0))
-    except Exception:
-        return float("nan")
+    except ValueError as exc:
+        raise ValueError("Target price is unreachable within volatility bounds [0.000001, 5]") from exc
 
 # -------------------------
 # Heston (Monte Carlo, feasible)
@@ -153,244 +190,16 @@ def forecast_arima(prices: List[float], horizon: int = 5) -> List[float]:
     fc = fit.forecast(steps=horizon)
     return list(np.exp(fc).astype(float))
 
-def make_lag_features(prices: np.ndarray, lags: int = 10):
-    X, y = [], []
-    for i in range(lags, len(prices)):
-        X.append(prices[i-lags:i])
-        y.append(prices[i])
-    return np.array(X, dtype=float), np.array(y, dtype=float)
+def arima_backtest(prices):
+    arr = np.asarray(prices, dtype=float)
+    split = int(0.8 * len(arr))
+    fitted = ARIMA(np.log(arr[:split]), order=(1, 1, 1)).fit()
+    predictions = []
+    for price in arr[split:]:
+        predictions.append(float(np.exp(fitted.forecast(steps=1)[0])))
+        fitted = fitted.append([np.log(price)], refit=False)
+    return backtest_metrics(arr[split:], predictions, arr[split - 1:-1])
 
-def forecast_ml_lags(prices: List[float], horizon: int = 5, lags: int = 10) -> List[float]:
-    arr = np.array(prices, dtype=float)
-    X, y = make_lag_features(arr, lags=lags)
-    if len(X) < 20:
-        # not enough data; fallback: repeat last
-        return [float(arr[-1])] * horizon
-
-    # A simple but real ML pipeline: standardize + ridge regression
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("ridge", Ridge(alpha=1.0))
-    ])
-    model.fit(X, y)
-
-    preds = []
-    window = arr[-lags:].copy()
-    for _ in range(horizon):
-        next_price = float(model.predict(window.reshape(1, -1))[0])
-        preds.append(next_price)
-        window = np.roll(window, -1)
-        window[-1] = next_price
-
-    return preds
-
-def confidence_band(prices, forecast):
-    import numpy as np
-
-    prices = np.asarray(prices, dtype=float)
-
-    # Handle both ARIMA (list) and ML (dict) outputs
-    if isinstance(forecast, dict):
-        forecast_vals = forecast["forecast"]
-    else:
-        forecast_vals = forecast
-
-    forecast_vals = np.asarray(forecast_vals, dtype=float)
-
-    # Volatility estimate from log returns
-    log_returns = np.diff(np.log(prices))
-    vol = float(np.std(log_returns))
-
-    z = 1.96  # 95% confidence
-    spread = z * vol
-
-    low = forecast_vals * np.exp(-spread)
-    high = forecast_vals * np.exp(spread)
-
-    return {
-        "low": low.tolist(),
-        "high": high.tolist(),
-        "vol_est": vol,
-    }
-# -------------------------
-# Portfolio Risk Helpers
-# -------------------------
-def compute_log_returns(prices: list[float]) -> np.ndarray:
-    prices = np.asarray(prices, dtype=float)
-    return np.diff(np.log(prices))
-def rolling_VaR(returns, weights, alpha=0.05, window=30):
-    returns = np.asarray(returns, dtype=float)
-    weights = np.asarray(weights, dtype=float)
-
-    portfolio_returns = returns @ weights
-
-    if len(portfolio_returns) < window:
-        return [], []
-
-    vars_, cvars_ = [], []
-
-    for i in range(window, len(portfolio_returns)):
-        window_slice = portfolio_returns[i - window : i]
-
-        var = np.quantile(window_slice, alpha)
-        cvar = window_slice[window_slice <= var].mean()
-
-        vars_.append(float(var))
-        cvars_.append(float(cvar))
-
-    return vars_, cvars_
-
-def build_returns_matrix(prices: list[list[float]]) -> np.ndarray:
-    returns = [compute_log_returns(p) for p in prices]
-    min_len = min(len(r) for r in returns)
-    returns = [r[-min_len:] for r in returns]
-    return np.column_stack(returns)
-def portfolio_var_cvar(returns: np.ndarray, weights: list[float], alpha=0.95):
-    weights = np.asarray(weights, dtype=float)
-    portfolio_returns = returns @ weights
-
-    var = np.percentile(portfolio_returns, (1 - alpha) * 100)
-    cvar = portfolio_returns[portfolio_returns <= var].mean()
-
-    return {
-        "VaR": float(var),
-        "CVaR": float(cvar),
-        "mean": float(portfolio_returns.mean()),
-        "vol": float(portfolio_returns.std()),
-    }
-def prices_to_returns(prices):
-    prices = np.asarray(prices, dtype=float)
-
-    # Handle 1D list → (T, 1)
-    if prices.ndim == 1:
-        prices = prices.reshape(-1, 1)
-
-    # Handle (1, T) → (T, 1)
-    if prices.shape[0] == 1 and prices.shape[1] > 1:
-        prices = prices.T
-
-    if prices.shape[0] < 2:
-        raise ValueError("Need at least 2 price observations to compute returns")
-
-    returns = np.diff(np.log(prices), axis=0)
-
-    return returns
-
-
-
-
-
-def normalize_weights(weights, n_assets):
-    if weights is None or len(weights) != n_assets:
-        return np.ones(n_assets) / n_assets
-
-    w = np.asarray(weights, dtype=float)
-    return w / w.sum()
-def compute_portfolio_risk(returns, weights, alpha=0.05):
-    returns = np.asarray(returns, dtype=float)
-    weights = np.asarray(weights, dtype=float)
-
-    if returns.ndim != 2:
-        raise ValueError("Returns must be 2D: (time, assets)")
-
-    if returns.shape[0] < 2:
-        raise ValueError("Not enough return observations")
-
-    # Normalize weights
-    weights = weights / np.sum(weights)
-
-    # Portfolio returns
-    portfolio_returns = returns @ weights
-
-    # ------------------
-    # Summary statistics
-    # ------------------
-    mu = np.mean(portfolio_returns)
-    sigma = np.std(portfolio_returns, ddof=1)
-
-    VaR = np.quantile(portfolio_returns, alpha)
-    CVaR = portfolio_returns[portfolio_returns <= VaR].mean()
-
-    # ------------------
-    # Rolling risk
-    # ------------------
-    rolling_var, rolling_cvar = rolling_VaR(
-        returns=returns,
-        weights=weights,
-        alpha=alpha,
-        window=30,
-    )
-
-    # ------------------
-    # Correlation
-    # ------------------
-    corr = np.corrcoef(returns.T)
-
-    # ------------------
-    # Stress tests
-    # ------------------
-    stress_results = {
-        "shock_-5pct": {
-            "mean": float(np.mean(portfolio_returns - 0.05)),
-            "vol": float(np.std(portfolio_returns - 0.05)),
-            "VaR": float(np.quantile(portfolio_returns - 0.05, alpha)),
-        },
-        "shock_-10pct": {
-            "mean": float(np.mean(portfolio_returns - 0.10)),
-            "vol": float(np.std(portfolio_returns - 0.10)),
-            "VaR": float(np.quantile(portfolio_returns - 0.10, alpha)),
-        },
-    }
-
-    # ------------------
-    # Final response
-    # ------------------
-    return {
-        "summary": {
-            "mean": float(mu),
-            "vol": float(sigma),
-            "VaR": float(VaR),
-            "CVaR": float(CVaR),
-        },
-        "rolling": {
-            "VaR": rolling_var,
-            "CVaR": rolling_cvar,
-        },
-        "correlation": corr.tolist(),
-        "stress": stress_results,
-    }
-
-def rolling_var_cvar(returns, weights, alpha, window):
-    port = returns.T @ weights
-    vars_, cvars_ = [], []
-
-    for i in range(window, len(port)):
-        slice_ = port[i - window : i]
-        var = np.percentile(slice_, 100 * alpha)
-        cvar = slice_[slice_ <= var].mean()
-        vars_.append(var)
-        cvars_.append(cvar)
-
-    return vars_, cvars_
-def correlation_matrix(returns):
-    return np.corrcoef(returns)
-def stress_test(returns, weights):
-    shocks = {
-        "market_crash_-20%": returns * 0.8,
-        "vol_spike_2x": returns * 2.0,
-        "mild_drawdown_-10%": returns * 0.9,
-    }
-
-    results = {}
-    for name, shocked in shocks.items():
-        port = shocked.T @ weights
-        results[name] = {
-            "mean": float(np.mean(port)),
-            "vol": float(np.std(port)),
-            "VaR": float(np.percentile(port, 5)),
-        }
-
-    return results
 
 # -------------------------
 # Request/Response models
@@ -398,60 +207,75 @@ def stress_test(returns, weights):
 
 OptType = Literal["call", "put"]
 
-class BSRequest(BaseModel):
-    S: float
-    K: float
-    T: float
+Positive = Annotated[float, Field(gt=0)]
+PriceSeries = Annotated[List[Positive], Field(min_length=3)]
+
+
+class RequestModel(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
+
+
+class BSRequest(RequestModel):
+    S: Positive
+    K: Positive
+    T: Positive
     r: float
-    sigma: float
+    sigma: Positive
     type: OptType
 
-class ImpliedVolRequest(BaseModel):
-    price: float
-    S: float
-    K: float
-    T: float
+
+class ImpliedVolRequest(RequestModel):
+    price: Positive
+    S: Positive
+    K: Positive
+    T: Positive
     r: float
     type: OptType
 
-class HestonRequest(BaseModel):
-    S: float
-    K: float
-    T: float
-    r: float
-    v0: float = 0.04
-    kappa: float = 2.0
-    theta: float = 0.04
-    vol_of_vol: float = 0.5
-    rho: float = -0.7
-    steps: int = 252
-    sims: int = 20000
 
-class MCRequest(BaseModel):
-    S0: float
+class HestonRequest(RequestModel):
+    S: Positive
+    K: Positive
+    T: Positive
+    r: float
+    v0: float = Field(0.04, ge=0)
+    kappa: Positive = 2.0
+    theta: float = Field(0.04, ge=0)
+    vol_of_vol: float = Field(0.5, ge=0)
+    rho: float = Field(-0.7, ge=-1, le=1)
+    steps: int = Field(252, ge=1, le=1000)
+    sims: int = Field(20000, ge=1, le=50000)
+
+
+class MCRequest(RequestModel):
+    S0: Positive
     mu: float
-    sigma: float
-    T: float = 1.0
-    steps: int = 252
-    sims: int = 20000
-    K: Optional[float] = None  # for payoff simulation (call payoff)
-    seed: int = 123
+    sigma: float = Field(..., ge=0)
+    T: Positive = 1.0
+    steps: int = Field(252, ge=1, le=1000)
+    sims: int = Field(20000, ge=1, le=50000)
+    K: Optional[Positive] = None
+    seed: int = Field(123, ge=0)
 
-class ForecastRequest(BaseModel):
-    prices: List[float] = Field(..., min_items=30)
+
+class ForecastRequest(RequestModel):
+    prices: List[Positive] = Field(..., min_length=30)
     horizon: int = Field(5, ge=1, le=60)
     method: Literal["arima", "ml"] = "ml"
 
-class PortfolioRiskRequest(BaseModel):
-    prices: List[List[float]]
-    weights: Optional[List[float]] = None
-    alpha: float = 0.05
 
-class PortfolioAutoRequest(BaseModel):
-    prices: List[List[float]]  # [[asset1 prices], [asset2 prices], ...]
+class PortfolioRiskRequest(RequestModel):
+    prices: List[PriceSeries] = Field(..., min_length=1)
     weights: Optional[List[float]] = None
     alpha: float = Field(0.05, gt=0, lt=0.5)
-    window: int = 252  # rolling window
+    window: int = Field(252, ge=2)
+
+
+class SingleRiskRequest(RequestModel):
+    prices: PriceSeries
+
+
+PortfolioAutoRequest = PortfolioRiskRequest
 # -------------------------
 # API endpoints
 # -------------------------
@@ -464,7 +288,7 @@ def health():
 def pricing_black_scholes(req: BSRequest):
     price = black_scholes_price(req.S, req.K, req.T, req.r, req.sigma, req.type)
     greeks = black_scholes_greeks(req.S, req.K, req.T, req.r, req.sigma, req.type)
-    return {"price": price, "greeks": greeks}
+    return finite_result({"price": price, "greeks": greeks})
 
 @app.post("/pricing/implied_vol")
 def pricing_implied_vol(req: ImpliedVolRequest):
@@ -479,7 +303,7 @@ def pricing_heston_call(req: HestonRequest):
         vol_of_vol=req.vol_of_vol, rho=req.rho,
         steps=req.steps, sims=req.sims
     )
-    return {"price": px, "method": "heston_mc", "steps": req.steps, "sims": req.sims}
+    return finite_result({"price": px, "method": "heston_mc", "steps": req.steps, "sims": req.sims})
 
 @app.post("/sim/gbm_paths")
 def sim_gbm_paths(req: MCRequest):
@@ -500,130 +324,45 @@ def sim_gbm_paths(req: MCRequest):
             "payoff_mean": float(payoff.mean()),
             "payoff_p95": float(np.percentile(payoff, 95)),
         })
-    return out
+    return finite_result(out)
 
 @app.post("/forecast")
 def forecast(req: ForecastRequest):
     if req.method == "arima":
-        fc_vals = forecast_arima(req.prices, horizon=req.horizon)
+        values = forecast_arima(req.prices, req.horizon)
+        result = {
+            "forecast": values, **confidence_band(req.prices, values),
+            "last_price": req.prices[-1], "backtest": arima_backtest(req.prices),
+        }
     else:
-        fc = ml_forecast(req.prices, horizon=req.horizon)
-        fc_vals = fc["forecast"]
+        result = ml_forecast(req.prices, req.horizon)
+    return finite_result({**result, "method": req.method, "horizon": req.horizon})
 
-    band = confidence_band(req.prices, fc_vals)
 
-    return {
-        "method": req.method,
-        "horizon": req.horizon,
-        "forecast": fc_vals,          # <-- ALWAYS array
-        "low": band["low"],            # <-- ALWAYS array
-        "high": band["high"],          # <-- ALWAYS array
-        "vol_est": band["vol_est"],
-        "last_price": float(req.prices[-1]),
-    }
-
-class FetchRequest(BaseModel):
-    symbol: str = Field(..., min_length=1)
-    period: str = Field("1y")          # e.g. 1mo, 3mo, 6mo, 1y, 2y, 5y, max
-    interval: str = Field("1d")        # e.g. 1m, 5m, 15m, 1h, 1d, 1wk
+class FetchRequest(RequestModel):
+    symbol: str = Field(..., min_length=1, max_length=32, pattern=r"^[A-Za-z0-9.^=\-]+$")
+    period: str = "1y"
+    interval: str = "1d"
 
 
 @app.post("/data/fetch")
 def data_fetch(req: FetchRequest):
-    return fetch_market_data(req.symbol)
-
-
-    # --- Safety rules for Yahoo Finance ---
-    interval_limits = {
-        "1m": "7d",
-        "2m": "60d",
-        "5m": "60d",
-        "15m": "60d",
-        "30m": "60d",
-        "60m": "730d",
-        "90m": "60d",
-        "1h": "730d",
-    }
-
-    period = req.period
-    interval = req.interval
-
-    # Auto-fix invalid intraday requests
-    if interval in interval_limits:
-        max_period = interval_limits[interval]
-        if period not in ["1d", "5d", "7d", "1mo", "3mo"] and max_period == "60d":
-            period = max_period
-
     try:
-        df = yf.download(
-            tickers=sym,
-            period=period,
-            interval=interval,
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-        )
+        return fetch_market_data(req.symbol, req.period, req.interval)
+    except RuntimeError:
+        return JSONResponse(status_code=502, content={
+            "detail": "Market data unavailable for this symbol/range. Check the symbol or retry later.",
+        })
 
-        if df is None or df.empty:
-            return {
-                "symbol": sym,
-                "dates": [],
-                "prices": [],
-                "error": f"No data returned for {sym}. Try interval=1d with period=1y.",
-            }
-
-        df = df.reset_index()
-
-        # Detect date column
-        date_col = "Date" if "Date" in df.columns else "Datetime"
-        close_col = "Close"
-
-        dates = [str(x) for x in df[date_col].astype(str).tolist()]
-        prices = [float(x) for x in df[close_col].astype(float).tolist()]
-
-        return {
-            "symbol": sym,
-            "dates": dates,
-            "prices": prices,
-            "interval": interval,
-            "period": period,
-            "count": len(prices),
-        }
-
-    except Exception as e:
-        return {
-            "symbol": sym,
-            "dates": [],
-            "prices": [],
-            "error": str(e),
-        }
-from app.risk import portfolio_risk, monte_carlo
 
 @app.post("/risk")
-def risk_endpoint(data: dict):
-    prices = data["prices"]
-    return {
-        "risk": portfolio_risk(prices),
-        "mc_paths": monte_carlo(prices),
-    }
+def risk_endpoint(req: SingleRiskRequest):
+    return finite_result({"risk": single_asset_risk(req.prices), "mc_paths": monte_carlo(req.prices)})
+
+
 @app.post("/risk/portfolio")
-def portfolio_risk(req: PortfolioRiskRequest):
-    return compute_portfolio_risk(
-        returns=req.returns,
-        weights=req.weights,
-        alpha=req.alpha,
-    )
 @app.post("/risk/portfolio/auto")
-def portfolio_risk_auto(req: PortfolioAutoRequest):
-    returns = prices_to_returns(req.prices)
-
-    if returns.shape[0] < 10:
-        raise ValueError("Need at least 10 return observations for risk metrics")
-
-    weights = normalize_weights(req.weights, returns.shape[1])
-
-    return compute_portfolio_risk(
-        returns=returns,
-        weights=weights,
-        alpha=req.alpha,
-    )
+def portfolio_risk_auto(req: PortfolioRiskRequest):
+    return finite_result(compute_portfolio_risk(
+        prices_to_returns(req.prices), req.weights, req.alpha, req.window,
+    ))

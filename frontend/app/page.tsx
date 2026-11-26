@@ -4,17 +4,12 @@ import React, { useMemo, useState } from "react";
 import PriceChart from "./components/PriceChart";
 
 import Papa from "papaparse";
-import {
-  ResponsiveContainer,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  Tooltip,
-  Area,
-  CartesianGrid,
-} from "recharts";
 import { apiPost } from "../lib/api";
+import { parsePortfolioRows, type PortfolioData } from "../lib/portfolio";
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
 
 type ForecastResp = {
   method: "ml" | "arima";
@@ -24,6 +19,12 @@ type ForecastResp = {
   high: number[];
   vol_est: number;
   last_price: number;
+  backtest: {
+    observations: number;
+    model: { mae: number; rmse: number };
+    random_walk: { mae: number; rmse: number };
+    rmse_skill: number | null;
+  };
 };
 
 type BSResp = {
@@ -54,13 +55,13 @@ type PortfolioRiskResp = {
   rolling: {
     VaR: number[];
     CVaR: number[];
+    window: number;
   };
-  correlation: number[][];
-  stress: Record<string, {
-    mean: number;
-    vol: number;
-    VaR: number;
-  }>;
+  correlation: (number | null)[][];
+  stress: Record<string,
+    { type: "one_time_price_shock"; portfolio_return: number; loss: number } |
+    { type: "volatility_scale"; mean: number; vol: number; VaR: number }
+  >;
 };
 
 
@@ -136,11 +137,11 @@ export default function Home() {
   const [busy, setBusy] = useState<string>("");
   const [err, setErr] = useState<string>("");
 
-  const canForecast = prices.length >= 30;
+  const canForecast = prices.length >= 30 && prices.every((p) => p > 0);
 
   const chartData = useMemo(() => {
     // If dates exist, label x-axis with index but tooltip shows date.
-    const rows: any[] = prices.map((p, i) => ({
+    const rows: { t: number; date: string; history?: number; forecast?: number; low?: number; high?: number }[] = prices.map((p, i) => ({
       t: i,
       date: dates[i] ?? String(i),
       history: p,
@@ -178,8 +179,8 @@ export default function Home() {
       setForecast(data);
       setS(Number((data.forecast?.[0] ?? data.last_price).toFixed(6)));
       setTab("forecast");
-    } catch (e: any) {
-      setErr(String(e?.message || e));
+    } catch (e: unknown) {
+      setErr(errorMessage(e));
     } finally {
       setBusy("");
     }
@@ -191,8 +192,8 @@ export default function Home() {
     try {
       const data = await apiPost<BSResp>("/pricing/black_scholes", { S, K, T, r, sigma, type });
       setBs(data);
-    } catch (e: any) {
-      setErr(String(e?.message || e));
+    } catch (e: unknown) {
+      setErr(errorMessage(e));
     } finally {
       setBusy("");
     }
@@ -206,8 +207,8 @@ export default function Home() {
       const data = await apiPost<IVResp>("/pricing/implied_vol", { price: target, S, K, T, r, type });
       setIv(data);
       if (Number.isFinite(data.implied_vol)) setSigma(Number(data.implied_vol.toFixed(6)));
-    } catch (e: any) {
-      setErr(String(e?.message || e));
+    } catch (e: unknown) {
+      setErr(errorMessage(e));
     } finally {
       setBusy("");
     }
@@ -228,8 +229,8 @@ export default function Home() {
       });
       setMc(data);
       setTab("options");
-    } catch (e: any) {
-      setErr(String(e?.message || e));
+    } catch (e: unknown) {
+      setErr(errorMessage(e));
     } finally {
       setBusy("");
     }
@@ -246,7 +247,7 @@ export default function Home() {
       skipEmptyLines: true,
       complete: (results) => {
         try {
-          const rows = results.data as Record<string, any>[];
+          const rows = results.data as Record<string, string>[];
 
           // Accept common column names
           const dateKey =
@@ -262,7 +263,7 @@ export default function Home() {
 
           for (const r of rows) {
             const px = Number.parseFloat(String(r[closeKey] ?? "").trim());
-            if (!Number.isFinite(px)) continue;
+            if (!Number.isFinite(px) || px <= 0) throw new Error("CSV prices must be positive numbers.");
 
             parsedPrices.push(px);
             parsedDates.push(dateKey ? String(r[dateKey]) : String(parsedPrices.length - 1));
@@ -278,8 +279,8 @@ export default function Home() {
           setIv(null);
           setMc(null);
           setTab("forecast");
-        } catch (e: any) {
-          setErr(String(e?.message || e));
+        } catch (e: unknown) {
+          setErr(errorMessage(e));
         } finally {
           setBusy("");
         }
@@ -291,7 +292,7 @@ export default function Home() {
     });
   }
 
-  function findKey(obj: Record<string, any> | undefined, candidates: string[]) {
+  function findKey(obj: Record<string, string> | undefined, candidates: string[]) {
     if (!obj) return null;
     const keys = Object.keys(obj);
     const lowered = new Map(keys.map((k) => [k.toLowerCase(), k]));
@@ -307,6 +308,30 @@ export default function Home() {
   // -----------------------
   const [period, setPeriod] = useState("1y");
   const [interval, setInterval] = useState("1d");
+  const [portfolio, setPortfolio] = useState<PortfolioData | null>(null);
+  const [weightsText, setWeightsText] = useState("");
+  const [riskWindow, setRiskWindow] = useState(252);
+
+  function uploadPortfolio(file: File) {
+    setErr("");
+    setBusy("csv");
+    Papa.parse<Record<string, string>>(file, {
+      header: true, skipEmptyLines: true,
+      complete: (result) => {
+        try {
+          if (result.errors.length) throw new Error(result.errors[0].message);
+          setPortfolio(parsePortfolioRows(result.meta.fields ?? [], result.data));
+          setWeightsText("");
+          setRisk(null);
+        } catch (error) {
+          setErr(errorMessage(error));
+        } finally {
+          setBusy("");
+        }
+      },
+      error: (error) => { setErr(error.message); setBusy(""); },
+    });
+  }
 
   async function fetchLive() {
     setErr("");
@@ -322,8 +347,8 @@ export default function Home() {
       setForecast(null);
       setTab("forecast");
       setS(Number(data.prices[data.prices.length - 1].toFixed(6)));
-    } catch (e: any) {
-      setErr(String(e?.message || e));
+    } catch (e: unknown) {
+      setErr(errorMessage(e));
     } finally {
       setBusy("");
     }
@@ -336,12 +361,19 @@ async function runPortfolioRisk() {
   try {
     const data = await apiPost<PortfolioRiskResp>(
       "/risk/portfolio/auto",
-      { prices: [prices], alpha: 0.05 }
+      {
+        prices: portfolio?.prices ?? [prices], alpha: 0.05, window: riskWindow,
+        ...(weightsText.trim() ? { weights: weightsText.split(",").map((w) => {
+          const weight = Number(w.trim());
+          if (!w.trim() || !Number.isFinite(weight)) throw new Error("Enter numeric weights separated by commas.");
+          return weight;
+        }) } : {}),
+      }
     );
     setRisk(data);
     setTab("risk");
-  } catch (e: any) {
-    setErr(String(e?.message || e));
+  } catch (e: unknown) {
+    setErr(errorMessage(e));
   } finally {
     setBusy("");
   }
@@ -376,7 +408,7 @@ async function runPortfolioRisk() {
 
       {tab === "data" && (
         <div style={styles.grid2}>
-          <Card title="Live Price Fetch" subtitle="Fetch adjusted close prices via backend (yfinance).">
+          <Card title="Live Price Fetch" subtitle="Fetch adjusted prices from Alpha Vantage or Yahoo Finance.">
             <div style={styles.row}>
               <label style={styles.inlineLabel}>
                 Ticker
@@ -385,6 +417,7 @@ async function runPortfolioRisk() {
               <label style={styles.inlineLabel}>
                 Period
                 <select value={period} onChange={(e) => setPeriod(e.target.value)} style={styles.select}>
+                  <option value="5d">5d</option>
                   <option value="1mo">1mo</option>
                   <option value="3mo">3mo</option>
                   <option value="6mo">6mo</option>
@@ -412,7 +445,7 @@ async function runPortfolioRisk() {
             </div>
 
             <div style={{ marginTop: 10, color: "#9ca3af", fontSize: 13 }}>
-              Tip: if interval is small (1m/5m), use shorter period like 1mo/3mo.
+              1m: use 5d. 5m/15m: use 1mo. 1h: up to 2y. Provider availability varies.
             </div>
           </Card>
 
@@ -435,7 +468,7 @@ async function runPortfolioRisk() {
 
       {tab === "forecast" && (
         <div style={styles.grid2}>
-          <Card title="Price History & Forecast" subtitle="History + forecast mean + band (low/high).">
+          <Card title="Price History & Forecast" subtitle="History, forecast, and approximate 95% uncertainty band.">
             <div style={{ height: 320 }}>
   <PriceChart data={chartData} />
 </div>
@@ -448,11 +481,23 @@ async function runPortfolioRisk() {
   label="Model"
   value={
     forecast.method === "ml"
-      ? "XGB • LGBM • RF • ElasticNet"
+      ? "Random Forest • ElasticNet"
       : "ARIMA"
   }
 />
                 <Stat label="Horizon" value={`${forecast.horizon}`} />
+              </div>
+            )}
+            {forecast && (
+              <div style={{ marginTop: 12 }}>
+                <b>One-step holdout backtest ({forecast.backtest.observations} observations)</b>
+                <div style={styles.statRow}>
+                  <Stat label="Model RMSE" value={forecast.backtest.model.rmse.toFixed(4)} />
+                  <Stat label="Random walk RMSE" value={forecast.backtest.random_walk.rmse.toFixed(4)} />
+                  <Stat label="Model MAE" value={forecast.backtest.model.mae.toFixed(4)} />
+                  <Stat label="Random walk MAE" value={forecast.backtest.random_walk.mae.toFixed(4)} />
+                </div>
+                <p>Random walk predicts tomorrow = today. Errors are in price units. This one-step check does not validate the full forecast horizon.</p>
               </div>
             )}
           </Card>
@@ -464,7 +509,7 @@ async function runPortfolioRisk() {
             <div style={styles.row}>
               <label style={styles.inlineLabel}>
                 Method
-                <select value={method} onChange={(e) => setMethod(e.target.value as any)} style={styles.select}>
+                <select value={method} onChange={(e) => setMethod(e.target.value as "ml" | "arima")} style={styles.select}>
                   <option value="ml">Machine Learning</option>
                   <option value="arima">ARIMA</option>
                 </select>
@@ -486,7 +531,7 @@ async function runPortfolioRisk() {
 
             {!canForecast && (
               <div style={{ marginTop: 10, color: "#fecaca" }}>
-                Need at least 30 prices (you have {prices.length}).
+                Need at least 30 positive prices (you have {prices.length}).
               </div>
             )}
           </Card>
@@ -519,7 +564,7 @@ async function runPortfolioRisk() {
               </label>
               <label style={styles.inlineLabel}>
                 Type
-                <select value={type} onChange={(e) => setType(e.target.value as any)} style={styles.select}>
+                <select value={type} onChange={(e) => setType(e.target.value as "call" | "put")} style={styles.select}>
                   <option value="call">Call</option>
                   <option value="put">Put</option>
                 </select>
@@ -566,7 +611,23 @@ async function runPortfolioRisk() {
 
       {tab === "risk" && (
   <div style={styles.grid2}>
-    <Card title="Portfolio Risk Summary" subtitle="VaR / CVaR @ 95%">
+    <Card title="Portfolio Risk Summary" subtitle="Simple returns per observation; VaR/CVaR at 95%, positive values mean losses.">
+      <label htmlFor="portfolio-csv" style={styles.label}>Multi-asset CSV (Date,AAPL,MSFT,...)</label>
+      <input id="portfolio-csv" type="file" accept=".csv,text/csv" disabled={busy !== ""} onChange={(event) => {
+        const file = event.target.files?.[0];
+        if (file) uploadPortfolio(file);
+        event.target.value = "";
+      }} style={styles.input} />
+      <p>{portfolio ? `${portfolio.symbols.join(", ")} — ${portfolio.dates.length} shared dates` : "Using the current single asset. Upload a CSV to analyze a portfolio."}</p>
+      {portfolio && <button style={styles.secondaryBtn} onClick={() => { setPortfolio(null); setWeightsText(""); setRisk(null); }}>Use current single asset</button>}
+      <div style={styles.row}>
+        <label style={styles.inlineLabel}>Weights (asset order above; blank = equal)
+          <input value={weightsText} onChange={(event) => setWeightsText(event.target.value)} placeholder="0.6,0.4" style={styles.input} />
+        </label>
+        <label style={styles.inlineLabel}>Rolling window (observations)
+          <input type="number" min={2} value={riskWindow} onChange={(event) => setRiskWindow(Number(event.target.value))} style={styles.input} />
+        </label>
+      </div>
       <button
         onClick={runPortfolioRisk}
         disabled={busy !== ""}
@@ -575,6 +636,7 @@ async function runPortfolioRisk() {
         {busy === "risk" ? "Computing..." : "Run Risk Analysis"}
       </button>
 
+      {risk && <p>Rolling window: {risk.rolling.window}; {risk.rolling.VaR.length} estimates{risk.rolling.VaR.length ? `; latest VaR ${(100 * risk.rolling.VaR.at(-1)!).toFixed(2)}%, CVaR ${(100 * risk.rolling.CVaR.at(-1)!).toFixed(2)}%` : " (not enough history for this window)"}.</p>}
       {risk && (
         <div style={styles.statRow}>
           <Stat label="Mean Return" value={risk.summary.mean.toFixed(6)} />
@@ -590,7 +652,9 @@ async function runPortfolioRisk() {
         Object.entries(risk.stress).map(([name, s]) => (
           <div key={name} style={{ marginBottom: 10 }}>
             <b>{name}</b><br />
-            Mean: {s.mean.toFixed(6)} | Vol: {s.vol.toFixed(6)} | VaR: {s.VaR.toFixed(6)}
+            {s.type === "one_time_price_shock"
+              ? `Immediate portfolio return: ${(100 * s.portfolio_return).toFixed(1)}%; loss: ${(100 * s.loss).toFixed(1)}%`
+              : `Mean: ${s.mean.toFixed(6)} | Vol: ${s.vol.toFixed(6)} | VaR: ${s.VaR.toFixed(6)}`}
           </div>
         ))}
     </Card>
@@ -599,8 +663,7 @@ async function runPortfolioRisk() {
 
 
       <div style={styles.footer}>
-        <div>Backend: <code>http://localhost:8000</code></div>
-        <div>Frontend: <code>http://localhost:3000</code></div>
+        <div>Educational analytics demo. Forecast bands assume independent errors and are not calibrated coverage guarantees.</div>
       </div>
     </main>
   );

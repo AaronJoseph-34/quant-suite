@@ -11,7 +11,6 @@ import {
   Area,
   CartesianGrid,
 } from "recharts";
-import { mean, deviation } from "d3-array";
 
 type ChartRow = {
   t: number;
@@ -38,10 +37,9 @@ function computeBollinger(
       .map((x) => x.history!)
       .filter(Number.isFinite);
 
-    const m = mean(slice);
-    const sd = deviation(slice);
-
-    if (!m || !sd) return d;
+    if (slice.length < 2) return d;
+    const m = slice.reduce((sum, value) => sum + value, 0) / slice.length;
+    const sd = Math.sqrt(slice.reduce((sum, value) => sum + (value - m) ** 2, 0) / (slice.length - 1));
 
     return {
       ...d,
@@ -53,7 +51,10 @@ function computeBollinger(
 }
 
 export default function PriceChart({ data }: { data: ChartRow[] }) {
-  const enriched = useMemo(() => computeBollinger(data), [data]);
+  const enriched = useMemo(() => computeBollinger(data).map((row) => ({
+    ...row,
+    forecastBand: row.low != null && row.high != null ? [row.low, row.high] : undefined,
+  })), [data]);
 
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -81,9 +82,9 @@ export default function PriceChart({ data }: { data: ChartRow[] }) {
             color: "#E5E7EB",
             fontSize: 12,
           }}
-          formatter={(value: any, name: any) => [value, String(name ?? "")]}
+          formatter={(value, name) => [String(value), String(name ?? "")]}
 
-          labelFormatter={(label: any) => {
+          labelFormatter={(label) => {
             const row = enriched.find((x) => x.t === label);
             return row?.date
               ? `t=${label} • ${row.date}`
@@ -130,6 +131,9 @@ export default function PriceChart({ data }: { data: ChartRow[] }) {
           dot={false}
           isAnimationActive={false}
         />
+
+        <Area type="monotone" dataKey="forecastBand" name="Approx. 95% band"
+          stroke="none" fill="#22D3EE" fillOpacity={0.16} isAnimationActive={false} />
 
         {/* Forecast */}
         <Line
