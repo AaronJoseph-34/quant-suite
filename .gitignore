@@ -12,3 +12,9 @@ node_modules/
 
 # Logs
 logs/
+
+# Generated output and local tooling
+dev/
+.venv/
+.pytest_cache/
+*.tsbuildinfo

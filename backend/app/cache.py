@@ -1,4 +1,5 @@
 import time
+from copy import deepcopy
 from typing import Any, Dict, Tuple
 
 # key -> (timestamp, data)
@@ -17,8 +18,8 @@ def get(key: str):
         del _CACHE[key]
         return None
 
-    return value
+    return deepcopy(value)
 
 
 def set(key: str, value: Any):
-    _CACHE[key] = (time.time(), value)
+    _CACHE[key] = (time.time(), deepcopy(value))

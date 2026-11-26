@@ -3,39 +3,18 @@ from sklearn.linear_model import ElasticNet
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import mean_squared_error
+from app.forecast_metrics import backtest_metrics, confidence_band
 
 
+def features(window):
+    return [*window, np.std(window), np.sum(window), np.max(window), np.min(window)]
 
-
-# ---------------------------
-# Feature Engineering
-# ---------------------------
 
 def make_features(prices, lags=10):
-    prices = np.asarray(prices, dtype=float)
-    returns = np.diff(np.log(prices))
+    returns = np.diff(np.log(np.asarray(prices, dtype=float)))
+    X = [features(returns[i - lags:i]) for i in range(lags, len(returns))]
+    return np.asarray(X), returns[lags:]
 
-    X, y = [], []
-
-    for i in range(lags, len(returns)):
-        window = returns[i - lags : i]
-
-        X.append([
-            *window,
-            np.std(window),
-            np.sum(window),
-            np.max(window),
-            np.min(window),
-        ])
-        y.append(returns[i])
-
-    return np.array(X), np.array(y)
-
-
-# ---------------------------
-# Model Zoo
-# ---------------------------
 
 def build_models():
     return {
@@ -43,107 +22,73 @@ def build_models():
             ("scaler", StandardScaler()),
             ("model", ElasticNet(alpha=0.01, l1_ratio=0.5)),
         ]),
-
         "rf": RandomForestRegressor(
-            n_estimators=300,
-            max_depth=6,
-            min_samples_leaf=5,
-            random_state=42,
+            n_estimators=300, max_depth=6, min_samples_leaf=5, random_state=42,
         ),
-
-        
     }
 
-
-# ---------------------------
-# Ensemble Training
-# ---------------------------
 
 def train_ensemble(X, y):
+    """Weight on a chronological validation suffix, then refit on X/y.
+
+    The third result is the ensemble's validation log-return MSE, not a weight.
+    """
+    if len(X) < 5:
+        raise ValueError("Need at least five feature observations")
     split = int(0.8 * len(X))
-    X_train, X_val = X[:split], X[split:]
-    y_train, y_val = y[:split], y[split:]
-
     models = build_models()
-    weights = {}
-    trained = {}
-
+    validation = {}
+    inverse_errors = {}
     for name, model in models.items():
-        model.fit(X_train, y_train)
-        preds = model.predict(X_val)
-        mse = mean_squared_error(y_val, preds)
-
-        trained[name] = model
-        weights[name] = 1 / (mse + 1e-6)  # inverse-error weighting
-
-    # Normalize weights
-    total = sum(weights.values())
-    for k in weights:
-        weights[k] /= total
-
-    return trained, weights, np.mean(list(weights.values()))
+        model.fit(X[:split], y[:split])
+        prediction = model.predict(X[split:])
+        validation[name] = prediction
+        inverse_errors[name] = 1 / (np.mean((y[split:] - prediction) ** 2) + 1e-12)
+    total = sum(inverse_errors.values())
+    weights = {name: error / total for name, error in inverse_errors.items()}
+    combined = sum(weights[name] * validation[name] for name in models)
+    mse = float(np.mean((y[split:] - combined) ** 2))
+    for model in models.values():
+        model.fit(X, y)
+    return models, weights, mse
 
 
-# ---------------------------
-# Forecast Engine
-# ---------------------------
+def ml_backtest(prices, lags=10):
+    """One-step predictions on the final 20%, with frozen models.
+
+    Only earlier observations fit/weight models. Observed test-period returns
+    can enter later lag windows; test targets never select model weights.
+    """
+    prices = np.asarray(prices, dtype=float)
+    X, y = make_features(prices, lags)
+    split = int(0.8 * len(X))
+    models, weights, _ = train_ensemble(X[:split], y[:split])
+    predicted_returns = sum(weights[n] * m.predict(X[split:]) for n, m in models.items())
+    previous = prices[lags + split:-1]
+    actual = prices[lags + split + 1:]
+    return backtest_metrics(actual, previous * np.exp(predicted_returns), previous)
+
 
 def ml_forecast(prices, horizon=10, lags=10):
     prices = np.asarray(prices, dtype=float)
-
+    if (prices.ndim != 1 or len(prices) < max(30, lags + 10)
+            or not np.all(np.isfinite(prices)) or np.any(prices <= 0)):
+        raise ValueError("Need at least 30 finite, positive prices and enough lag observations")
+    if horizon < 1 or horizon > 60:
+        raise ValueError("Horizon must be between 1 and 60")
+    backtest = ml_backtest(prices, lags)
     X, y = make_features(prices, lags)
-    models, weights, avg_error = train_ensemble(X, y)
-
-def ml_forecast(prices, horizon=10, lags=10):
-    import numpy as np
-
-    prices = np.asarray(prices, dtype=float)
-
-    # Build features
-    X, y = make_features(prices, lags)
-    models, weights, avg_error = train_ensemble(X, y)
-
-    # Log returns (NumPy array ONLY)
+    models, weights, mse = train_ensemble(X, y)
     returns = np.diff(np.log(prices))
-
-    preds = np.zeros(horizon, dtype=float)
-
-    for i in range(horizon):
-        window = returns[-lags:]
-
-        feats = np.array([
-            *window,
-            np.std(window),
-            np.sum(window),
-            np.max(window),
-            np.min(window),
-        ], dtype=float).reshape(1, -1)
-
-        r_hat = 0.0
-        for name, model in models.items():
-            r_hat += weights[name] * float(model.predict(feats)[0])
-
-        preds[i] = r_hat
-        returns = np.append(returns, r_hat)
-
-    # Price forecast
-    last_price = float(prices[-1])
-    forecast = np.asarray(last_price * np.exp(np.cumsum(preds)), dtype=float)
-
-    # Confidence bands
-    sigma = float(np.sqrt(avg_error))
-    z = 1.96
-
-    low = forecast * np.exp(-z * sigma)
-    high = forecast * np.exp(z * sigma)
-
+    predictions = []
+    for _ in range(horizon):
+        row = np.asarray(features(returns[-lags:])).reshape(1, -1)
+        prediction = sum(weights[n] * float(m.predict(row)[0]) for n, m in models.items())
+        predictions.append(prediction)
+        returns = np.append(returns, prediction)
+    forecast = prices[-1] * np.exp(np.cumsum(predictions))
     return {
-        "method": "ml_ensemble",
-        "forecast": forecast.tolist(),
-        "low": low.tolist(),
-        "high": high.tolist(),
-        "vol_est": sigma,
-        "last_price": last_price,
-        "model_weights": weights,
+        "method": "ml_ensemble", "forecast": forecast.tolist(),
+        **confidence_band(prices, forecast, sigma=np.sqrt(mse)),
+        "last_price": float(prices[-1]), "model_weights": weights, "backtest": backtest,
     }
-

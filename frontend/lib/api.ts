@@ -1,19 +1,17 @@
-const API_BASE = "https://quant-suite-production.up.railway.app";
-
 export async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  console.log("API_BASE:", API_BASE);
-  console.log("Calling:", `${API_BASE}${path}`);
-
-  const res = await fetch(`${API_BASE}${path}`, {
+  const base = (process.env.NEXT_PUBLIC_API_BASE?.trim() || "http://localhost:8000").replace(/\/+$/, "");
+  const response = await fetch(`${base}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`API ${path} failed: ${res.status} ${text}`);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    const detail = payload?.detail;
+    const message = typeof detail === "string" ? detail : Array.isArray(detail)
+      ? detail.map((e: { loc: string[]; msg: string }) => `${e.loc.slice(1).join(".")}: ${e.msg}`).join("; ")
+      : `Request failed (${response.status})`;
+    throw new Error(message);
   }
-
-  return res.json() as Promise<T>;
+  return response.json() as Promise<T>;
 }
